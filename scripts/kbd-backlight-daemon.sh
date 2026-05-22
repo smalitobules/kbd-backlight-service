@@ -4,8 +4,9 @@ set -euo pipefail
 seat="${SEAT:-auto}"
 timeout_ms="${TIMEOUT_MS:-6000}"
 boot_level="${BOOT_LEVEL:-1}"
-poll_interval="${POLL_INTERVAL:-0.25}"
+poll_interval="${POLL_INTERVAL:-1}"
 state_dir="${STATE_DIR:-/var/lib/kbd-backlight-service}"
+device_glob="${DEVICE_GLOB:-/sys/class/leds/asus::kbd_backlight}"
 
 declare -a devices=()
 declare -A boot_levels=()
@@ -20,6 +21,7 @@ declare -A manual_activity_until_ms=()
 
 last_session_uid=""
 last_allow_manual_off=-1
+active_seat=""
 resume_uid=""
 
 require_tools() {
@@ -47,6 +49,44 @@ require_tools() {
         printf '%s\n' "sleep is missing." >&2
         exit 1
     }
+    command -v date >/dev/null 2>&1 || {
+        printf '%s\n' "date is missing." >&2
+        exit 1
+    }
+    command -v chmod >/dev/null 2>&1 || {
+        printf '%s\n' "chmod is missing." >&2
+        exit 1
+    }
+}
+
+die() {
+    printf '%s\n' "$1" >&2
+    exit 1
+}
+
+require_positive_integer() {
+    local name="$1"
+    local value="$2"
+
+    [[ "${value}" =~ ^[0-9]+$ ]] || die "${name} must be a positive integer."
+    (( value > 0 )) || die "${name} must be greater than 0."
+}
+
+require_poll_interval() {
+    [[ "${poll_interval}" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "POLL_INTERVAL must be a positive number."
+    [[ ! "${poll_interval}" =~ ^0+([.]0+)?$ ]] || die "POLL_INTERVAL must be greater than 0."
+}
+
+require_configuration() {
+    require_positive_integer "TIMEOUT_MS" "${timeout_ms}"
+    require_positive_integer "BOOT_LEVEL" "${boot_level}"
+    require_poll_interval
+    [[ "${state_dir}" == "/var/lib/kbd-backlight-service" ]] || die "STATE_DIR must be /var/lib/kbd-backlight-service."
+    [[ ! -L "${state_dir}" ]] || die "STATE_DIR must not be a symlink."
+    [[ "${device_glob}" == /sys/class/leds/* ]] || die "DEVICE_GLOB must point inside /sys/class/leds."
+    [[ "${device_glob}" =~ ^/sys/class/leds/[[:alnum:]_:.*/+-]+$ ]] || die "DEVICE_GLOB contains unsupported characters."
+    [[ "${device_glob}" != *..* ]] || die "DEVICE_GLOB must not contain '..'."
+    [[ ! "${device_glob}" =~ [[:space:]] ]] || die "DEVICE_GLOB must not contain whitespace."
 }
 
 read_value() {
@@ -111,15 +151,21 @@ clamp_boot_level() {
 }
 
 refresh_devices() {
-    shopt -s nullglob
-    devices=(/sys/class/leds/*kbd_backlight*)
-    shopt -u nullglob
+    local candidate=""
+
+    devices=()
+    while IFS= read -r candidate; do
+        [[ -d "${candidate}" ]] || continue
+        [[ -r "${candidate}/brightness" ]] || continue
+        [[ -r "${candidate}/max_brightness" ]] || continue
+        devices+=("${candidate}")
+    done < <(compgen -G "${device_glob}")
 }
 
 require_devices() {
     refresh_devices
     [[ "${#devices[@]}" -gt 0 ]] || {
-        printf '%s\n' "No keyboard backlight devices matched /sys/class/leds/*kbd_backlight*." >&2
+        printf '%s\n' "No keyboard backlight devices matched ${device_glob}." >&2
         exit 1
     }
 }
@@ -129,12 +175,15 @@ load_boot_levels() {
     local file=""
     local value=""
 
-    install -d -m755 "${state_dir}"
+    install -d -m700 "${state_dir}"
+    chmod 700 "${state_dir}"
 
     for device in "${devices[@]}"; do
         file="$(state_file_for_device "${device}")"
         value=""
         if [[ -r "${file}" ]]; then
+            [[ ! -L "${file}" ]] || die "State file must not be a symlink: ${file}"
+            chmod 600 "${file}"
             value="$(<"${file}")"
         fi
         boot_levels["${device}"]="$(clamp_boot_level "${value:-${boot_level}}")"
@@ -152,9 +201,12 @@ save_boot_level() {
         return 0
     fi
 
-    install -d -m755 "${state_dir}"
+    install -d -m700 "${state_dir}"
+    chmod 700 "${state_dir}"
     file="$(state_file_for_device "${device}")"
+    [[ ! -L "${file}" ]] || die "State file must not be a symlink: ${file}"
     printf '%s\n' "${normalized}" >"${file}"
+    chmod 600 "${file}"
     boot_levels["${device}"]="${normalized}"
 }
 
@@ -188,6 +240,7 @@ write_level() {
     local requested="$3"
     local max_level
     local current_level
+    local actual_level
     local key=""
 
     max_level="$(read_value "${device}/max_brightness" 1)"
@@ -204,18 +257,31 @@ write_level() {
         requested=0
     fi
 
+    if [[ -n "${uid}" ]] && set_user_gnome_brightness "${uid}" "${requested}" "${max_level}"; then
+        actual_level="$(read_value "${device}/brightness" 0)"
+        if (( actual_level == requested )); then
+            if [[ -n "${key}" ]]; then
+                managed_levels["${key}"]="${actual_level}"
+            fi
+            return 0
+        fi
+        current_level="${actual_level}"
+    fi
+
     if (( current_level != requested )); then
-        if echo "${requested}" >"${device}/brightness" 2>/dev/null; then
+        if echo "${requested}" >"${device}/brightness"; then
             if [[ -n "${key}" ]]; then
                 managed_levels["${key}"]="${requested}"
             fi
+        else
+            printf '%s\n' "Failed to write brightness ${requested} to ${device}." >&2
         fi
     elif [[ -n "${key}" ]]; then
         managed_levels["${key}"]="${requested}"
     fi
 
     if [[ -n "${uid}" ]]; then
-        sync_user_gnome_brightness "${uid}" "${requested}" "${max_level}"
+        set_user_gnome_brightness "${uid}" "${requested}" "${max_level}" >/dev/null 2>&1 || true
     fi
 }
 
@@ -255,10 +321,19 @@ resolved_seat() {
         return 0
     fi
 
+    if [[ -n "${active_seat}" ]]; then
+        active_sid="$(loginctl show-seat "${active_seat}" -p ActiveSession --value 2>/dev/null || true)"
+        if [[ -n "${active_sid}" ]]; then
+            printf '%s\n' "${active_seat}"
+            return 0
+        fi
+    fi
+
     while read -r seat_name _; do
         [[ -n "${seat_name}" ]] || continue
         active_sid="$(loginctl show-seat "${seat_name}" -p ActiveSession --value 2>/dev/null || true)"
         if [[ -n "${active_sid}" ]]; then
+            active_seat="${seat_name}"
             printf '%s\n' "${seat_name}"
             return 0
         fi
@@ -266,6 +341,7 @@ resolved_seat() {
 
     while read -r _ _ _ seat_name _; do
         if [[ -n "${seat_name}" ]] && [[ "${seat_name}" != "-" ]]; then
+            active_seat="${seat_name}"
             printf '%s\n' "${seat_name}"
             return 0
         fi
@@ -282,32 +358,43 @@ active_session_id() {
     loginctl show-seat "${current_seat}" -p ActiveSession --value 2>/dev/null || true
 }
 
-session_property() {
+session_properties() {
     local sid="$1"
-    local key="$2"
 
-    loginctl show-session "${sid}" -p "${key}" --value 2>/dev/null || true
+    loginctl show-session "${sid}" -p User -p Class -p LockedHint --value 2>/dev/null || true
 }
 
-idle_ms_for_uid() {
+user_gdbus_call() {
     local uid="$1"
     local bus_path=""
     local gid=""
-    local output=""
 
+    shift
+    [[ -n "${uid}" ]] || return 1
     bus_path="$(session_bus_path_for_uid "${uid}")"
     [[ -S "${bus_path}" ]] || return 1
     gid="$(id -g "${uid}" 2>/dev/null || true)"
     [[ -n "${gid}" ]] || return 1
 
+    setpriv \
+        --reuid "${uid}" \
+        --regid "${gid}" \
+        --clear-groups \
+        env \
+        XDG_RUNTIME_DIR="/run/user/${uid}" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=${bus_path}" \
+        gdbus call \
+        --session \
+        "$@"
+}
+
+idle_ms_for_uid() {
+    local uid="$1"
+    local output=""
+
     output="$(
-        setpriv \
-            --reuid "${uid}" \
-            --regid "${gid}" \
-            --clear-groups \
-            env DBUS_SESSION_BUS_ADDRESS="unix:path=${bus_path}" \
-            gdbus call \
-            --session \
+        user_gdbus_call \
+            "${uid}" \
             --dest org.gnome.Mutter.IdleMonitor \
             --object-path /org/gnome/Mutter/IdleMonitor/Core \
             --method org.gnome.Mutter.IdleMonitor.GetIdletime \
@@ -318,19 +405,11 @@ idle_ms_for_uid() {
     printf '%s\n' "${BASH_REMATCH[1]}"
 }
 
-sync_user_gnome_brightness() {
+set_user_gnome_brightness() {
     local uid="$1"
     local level="$2"
     local max_level="$3"
-    local bus_path=""
-    local gid=""
     local percent=0
-
-    [[ -n "${uid}" ]] || return 0
-    bus_path="$(session_bus_path_for_uid "${uid}")"
-    [[ -S "${bus_path}" ]] || return 0
-    gid="$(id -g "${uid}" 2>/dev/null || true)"
-    [[ -n "${gid}" ]] || return 0
 
     if (( max_level > 0 )); then
         percent=$(( (level * 100) / max_level ))
@@ -342,20 +421,15 @@ sync_user_gnome_brightness() {
         percent=100
     fi
 
-    setpriv \
-        --reuid "${uid}" \
-        --regid "${gid}" \
-        --clear-groups \
-        env DBUS_SESSION_BUS_ADDRESS="unix:path=${bus_path}" \
-        gdbus call \
-        --session \
+    user_gdbus_call \
+        "${uid}" \
         --dest org.gnome.SettingsDaemon.Power \
         --object-path /org/gnome/SettingsDaemon/Power \
         --method org.freedesktop.DBus.Properties.Set \
         org.gnome.SettingsDaemon.Power.Keyboard \
         Brightness \
-        "<${percent}>" \
-        >/dev/null 2>&1 || true
+        "<int32 ${percent}>" \
+        >/dev/null 2>&1
 }
 
 activate_uid() {
@@ -421,7 +495,7 @@ observe_session_state() {
                     last_nonzero_levels["${device}"]="${current_level}"
                     save_boot_level "${device}" "${current_level}"
                     max_level="$(read_value "${device}/max_brightness" 1)"
-                    sync_user_gnome_brightness "${resume_uid}" "${current_level}" "${max_level}"
+                    set_user_gnome_brightness "${resume_uid}" "${current_level}" "${max_level}" >/dev/null 2>&1 || true
                 fi
             fi
         fi
@@ -533,8 +607,10 @@ main() {
     local manual_deadline_ms=0
     local allow_manual_off=0
     local capture_login_level=0
+    local -a session_values=()
 
     require_tools
+    require_configuration
     require_devices
     load_boot_levels
     trap restore_boot_level EXIT
@@ -556,7 +632,8 @@ main() {
             continue
         fi
 
-        uid="$(session_property "${sid}" User)"
+        mapfile -t session_values < <(session_properties "${sid}")
+        uid="${session_values[0]:-}"
         if [[ -z "${uid}" ]]; then
             force_boot_levels
             last_session_uid=""
@@ -565,8 +642,8 @@ main() {
             continue
         fi
 
-        session_class="$(session_property "${sid}" Class)"
-        locked_hint="$(session_property "${sid}" LockedHint)"
+        session_class="${session_values[1]:-}"
+        locked_hint="${session_values[2]:-}"
         allow_manual_off=0
         capture_login_level=0
         if [[ "${session_class}" == "user" ]] && [[ "${locked_hint}" != "yes" ]]; then
