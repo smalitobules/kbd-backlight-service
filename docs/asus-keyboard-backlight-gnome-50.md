@@ -1,222 +1,202 @@
 # ASUS Keyboard Backlight unter GNOME 50
 
-## Zielzustand
+## Plattform
 
-Der Dienst läuft als root-eigene `systemd`-Unit und verwaltet die ASUS-Tastaturbeleuchtung über Geräte unter `/sys/class/leds/*kbd_backlight*`.
+Der Dienst ist für diesen Scope freigegeben:
 
-Zielplattform ist der aktuell geprüfte ASUS-Laptop unter Ubuntu 26.04 LTS mit GNOME Shell 50. Direkte sysfs-Schreibzugriffe bleiben für Start, Herunterfahren, fehlende GNOME-Sitzungen und nicht verfügbare DBus-Endpunkte erhalten.
+- Gerät: `/sys/class/leds/asus::kbd_backlight`
+- Maximale Rohhelligkeit: `3`
+- Desktop: GNOME Shell 50
+- Distribution: Ubuntu 26.04 LTS
+- Unit: `kbd-backlight-service.service`
 
-Der aktive GNOME-Schreibpfad ist:
+Andere Hersteller, andere LED-Namen, mehrere Keyboard-Backlights und abweichende Helligkeitsskalen sind nicht validiert.
 
-- DBus-Ziel: `org.gnome.SettingsDaemon.Power`
-- Objektpfad: `/org/gnome/SettingsDaemon/Power`
-- Interface: `org.freedesktop.DBus.Properties`
-- Eigenschaft: `org.gnome.SettingsDaemon.Power.Keyboard Brightness`
-- Werttyp: `int32`
+## Systemarchitektur
 
-Der Aufruf läuft im Kontext der aktiven Benutzer-ID mit:
+Der root-Daemon verwaltet:
+
+- logind-Systembus
+- sysfs-Lesen und sysfs-Schreiben
+- State unter `/var/lib/kbd-backlight-service`
+- Gerätesuche über `DEVICE_GLOB`
+- User-DBus-Worker
+- Reconcile-Timer
+
+Der User-DBus-Worker läuft mit Ziel-UID und Ziel-GID der aktiven relevanten Sitzung. Er verbindet sich mit:
 
 - `XDG_RUNTIME_DIR=/run/user/<uid>`
 - `DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/<uid>/bus`
 
-Damit bleiben GNOMEs prozentualer Helligkeitszustand und der rohe Kernel-LED-Wert synchron.
+Der Worker meldet GNOME-Ereignisse per JSON-Zeilen an den root-Daemon zurück und führt GNOME-Helligkeitsschreibvorgänge aus. Er liest oder schreibt keinen State und keine sysfs-Dateien.
 
-Der Dienst bewirbt keinen allgemeinen Laptop-Support. Generische Geräteerkennung ist technische Vorbereitung, nicht fachliche Gerätefreigabe.
-
-## Gerätescope
-
-Aktuell validiert ist:
-
-- sysfs-Gerät: `/sys/class/leds/asus::kbd_backlight`
-- sysfs-Maximum: `3`
-- GNOME `Brightness=33` entspricht sysfs `brightness=1`
-- GNOME `Brightness=0` entspricht sysfs `brightness=0`
-- Default-Geräteauswahl: `DEVICE_GLOB=/sys/class/leds/asus::kbd_backlight`
-
-Andere Hersteller, mehrere Keyboard-Backlight-Geräte und abweichende Helligkeitsstufen sind noch nicht validiert. Die Implementierung darf generisch über `*kbd_backlight*` suchen, die fachliche Abnahme dieser Doku bezieht sich aber auf das ASUS-Gerät.
-
-## Schnittstellen
+## DBus-Schnittstellen
 
 GNOME Mutter IdleMonitor:
 
-- Bus: aktive Benutzer-Session
 - Ziel: `org.gnome.Mutter.IdleMonitor`
 - Objektpfad: `/org/gnome/Mutter/IdleMonitor/Core`
 - Interface: `org.gnome.Mutter.IdleMonitor`
-- Methoden: `GetIdletime`, `AddIdleWatch`, `AddUserActiveWatch`, `RemoveWatch`
+- Methoden: `GetIdletime`, `AddIdleWatch`, `AddUserActiveWatch`
 - Signal: `WatchFired`
 
-GNOME Settings Daemon Power Keyboard:
+GNOME SettingsDaemon Power Keyboard:
 
-- Bus: aktive Benutzer-Session
 - Ziel: `org.gnome.SettingsDaemon.Power`
 - Objektpfad: `/org/gnome/SettingsDaemon/Power`
 - Interface: `org.gnome.SettingsDaemon.Power.Keyboard`
-- Methoden: `StepUp`, `StepDown`, `Toggle`
 - Signal: `BrightnessChanged(i brightness, s source)`
 - Eigenschaft: `Brightness` als `int32`
-- Eigenschaft: `Steps` als `int32`
 
 logind Manager:
 
-- Bus: Systembus
 - Ziel: `org.freedesktop.login1`
 - Objektpfad: `/org/freedesktop/login1`
 - Interface: `org.freedesktop.login1.Manager`
-- Methoden: `ListSeats`, `ListSessions`, `GetSeat`, `GetSession`
-- Signale: `SeatNew`, `SeatRemoved`, `SessionNew`, `SessionRemoved`, `PrepareForShutdown`, `PrepareForSleep`
+- Methoden: `ListSessions`, `GetSession`
+- Signale: `SessionNew`, `SessionRemoved`, `SeatNew`, `SeatRemoved`, `PrepareForShutdown`, `PrepareForSleep`
 
 logind Session:
 
-- Bus: Systembus
-- Objektpfad: aus `GetSession(<sid>)`
 - Interface: `org.freedesktop.login1.Session`
 - Eigenschaften: `User`, `Seat`, `Class`, `Type`, `Active`, `State`, `LockedHint`
 - Signale: `Lock`, `Unlock`
 - Property-Änderungen: `org.freedesktop.DBus.Properties.PropertiesChanged`
 
-## Zustandsmodell
+## Sitzungslogik
 
-Der Dienst unterscheidet diese Zustände:
+Bei `SEAT=auto` wählt der Dienst eine aktive grafische Sitzung auf einem Seat. Bei gesetztem `SEAT` wird nur dieser Seat betrachtet.
 
-- keine aktive Sitzung
-- aktive Benutzer-Sitzung entsperrt
-- aktive Benutzer-Sitzung gesperrt
-- Greeter oder Login-Bildschirm
-- GNOME-DBus verfügbar
-- GNOME-DBus nicht verfügbar
-- sysfs-Gerät verfügbar
-- sysfs-Gerät vorübergehend nicht verfügbar
+Eine entsperrte Kontositzung ist:
 
-Für aktive entsperrte GNOME-Sitzungen schreibt der Dienst zuerst über GNOME DBus. Danach wird der sysfs-Wert geprüft. Wenn GNOME den Zielwert nicht anwendet, schreibt der Dienst über sysfs und synchronisiert GNOME erneut.
+- `Class=user`
+- `LockedHint=false`
+- `Active=true`
 
-Für Sitzungen ohne nutzbaren GNOME-DBus schreibt der Dienst direkt über sysfs.
-
-Die aktive Sitzung wird über logind bestimmt:
-
-- Bei `SEAT=auto` den Seat mit aktiver grafischer Sitzung wählen.
-- Bei gesetztem `SEAT` nur diesen Seat betrachten.
-- Nur Sitzungen mit `Active=true` verwenden.
-- Eine entsperrte Benutzersitzung ist `Class=user` und `LockedHint=false`.
-- Gesperrte Benutzersitzungen haben `Class=user` und `LockedHint=true`.
-- Greeter-, Manager- und Login-Zustände sind nicht als entsperrte Benutzersitzung zu behandeln.
+Gesperrte Kontositzungen, Greeter- und Login-Zustände sind keine entsperrten Kontositzungen.
 
 ## Helligkeitsregeln
 
-Der Dienst verwaltet rohe sysfs-Werte im Bereich `0..max_brightness`. GNOME verwaltet Prozentwerte im Bereich `0..100`.
+Der Dienst speichert und entscheidet in sysfs-Rohwerten. GNOME verwaltet Prozentwerte.
 
-Die Umrechnung erfolgt deterministisch:
-
-- sysfs-Zielwert `0` wird als GNOME `Brightness=0` geschrieben
-- positive sysfs-Zielwerte werden mit Ganzzahldivision prozentual zu `max_brightness` geschrieben
-- Prozentwerte werden auf `0..100` begrenzt
-- sysfs-Zielwerte werden auf `0..max_brightness` begrenzt
-
-Formel für Rohwert zu Prozent:
+Rohwert zu Prozent:
 
 ```text
 percent = (level * 100) / max_brightness
 ```
 
-Formel für Prozent zu Rohwert:
+Prozent zu Rohwert:
 
 ```text
 level = (percent * max_brightness + 50) / 100
 ```
 
-Bei `percent > 0` wird das Ergebnis zusätzlich auf mindestens `1` begrenzt. Dadurch wird GNOME `Brightness=33` bei `max_brightness=3` korrekt zu sysfs-Wert `1`.
+Zusätzliche Regeln:
 
-Beim Schreiben ist der rohe sysfs-Zielwert maßgeblich. Nach einem GNOME-DBus-Schreibvorgang muss sysfs erneut gelesen werden. Nur wenn der sysfs-Wert dem Zielwert entspricht, gilt der Schreibvorgang als erfolgreich.
+- `percent <= 0` ergibt Rohwert `0`.
+- `percent > 0` ergibt mindestens Rohwert `1`.
+- Rohwerte werden auf `0..max_brightness` begrenzt.
+- Prozentwerte werden auf `0..100` begrenzt.
+- Nach GNOME-Schreibvorgängen wird sysfs geprüft.
+- Wenn GNOME den Zielwert nicht in sysfs abbildet, schreibt der root-Daemon sysfs und synchronisiert GNOME erneut.
 
-Ein manueller Wert `0` in einer entsperrten Benutzer-Sitzung bleibt eine explizite Benutzerentscheidung. Der Dienst erzwingt in diesem Zustand kein Wiederanschalten.
+## Zustandsregeln
 
-Sperrbildschirm und Greeter werden beim Eintritt auf `BOOT_LEVEL` gesetzt. Danach bleiben dortige Änderungen bis zum Sitzungswechsel erlaubt und überschreiben keine Konto-Persistenz.
+Entsperrte Kontositzung:
 
-Start, Herunterfahren und fehlende aktive Sitzungen verwenden `BOOT_LEVEL`.
+- nutzt den pro Konto gespeicherten positiven Wert
+- dimmt bei Idle auf `0`
+- stellt bei Aktivität den letzten sichtbaren Konto-Wert wieder her
+- respektiert manuelles `0`
+- persistiert positive manuelle Änderungen pro UID
 
-Entsperrte Benutzer-Sitzungen verwenden den pro Konto gespeicherten positiven Wert.
+Sperrbildschirm und Greeter:
 
-## Ereignissteuerung
+- werden beim Eintritt einmal auf `BOOT_LEVEL` gesetzt
+- erlauben danach Änderungen bis zum Sitzungswechsel
+- persistieren keine Helligkeitsänderungen
+- überschreiben keine Konto-Werte
 
-Der Dienst verwendet einen Python-Daemon mit Ereignisquellen für GNOME, logind und sysfs. Der Standardwert für den langsamen Abgleich ist:
+Keine aktive Sitzung, Boot und Herunterfahren:
 
+- verwenden `BOOT_LEVEL`
+- persistieren nie `0`
+
+## State
+
+Der State-Ordner ist:
+
+- `/var/lib/kbd-backlight-service`
+- Modus `0700`
+
+Konto-Helligkeiten werden pro UID und Gerät gespeichert. Der Dateiname besteht aus dem bereinigten Gerätenamen und der UID, zum Beispiel:
+
+- `/var/lib/kbd-backlight-service/asus__kbd_backlight.uid-1000.level`
+
+Fehlende oder ungültige Konto-Dateien fallen auf `BOOT_LEVEL` zurück. Runtime-Pakete, die durch den Installer neu installiert wurden, stehen in:
+
+- `/var/lib/kbd-backlight-service/runtime-packages.installed`
+
+`disable`, `uninstall` und `revert` löschen keine Konto-Helligkeiten.
+
+## Unit-Härtung
+
+Die installierte Unit nutzt unter anderem:
+
+- `NoNewPrivileges=yes`
+- `PrivateTmp=yes`
+- `ProtectSystem=strict`
+- `ProtectHome=read-only`
+- `ReadWritePaths=/sys/class/leds /var/lib/kbd-backlight-service`
+- `ReadOnlyPaths=/run/user /run/dbus`
+- `RestrictAddressFamilies=AF_UNIX`
+- `CapabilityBoundingSet=CAP_SETUID CAP_SETGID`
+- `UMask=0077`
+
+## Konfiguration
+
+Standardwerte:
+
+- `SEAT=auto`
+- `TIMEOUT_MS=6000`
+- `BOOT_LEVEL=1`
 - `POLL_INTERVAL=10`
+- `STATE_DIR=/var/lib/kbd-backlight-service`
+- `DEVICE_GLOB=/sys/class/leds/asus::kbd_backlight`
 
-Der normale GNOME-Betrieb läuft über:
+`STATE_DIR` ist absichtlich fest auf `/var/lib/kbd-backlight-service` begrenzt. `DEVICE_GLOB` muss unter `/sys/class/leds` liegen und darf keine Leerzeichen, kein `..` und keine nicht unterstützten Zeichen enthalten.
 
-- `org.gnome.Mutter.IdleMonitor.AddIdleWatch`
-- `org.gnome.Mutter.IdleMonitor.AddUserActiveWatch`
-- `org.gnome.SettingsDaemon.Power.Keyboard.BrightnessChanged`
-- logind-Signale für Seat-, Session- und Sperrstatusänderungen
-- `inotify` auf `brightness`-Dateien
+## Betrieb
 
-Der langsame Abgleich erkennt verlorene Ereignisse, neue oder entfernte sysfs-Geräte und divergierende Helligkeitszustände.
-
-## Dienst-Lifecycle
-
-Skriptkommandos:
-
-- `install`: installiert Daemon und Unit, aktiviert den Dienst und startet ihn neu
-- `status`: zeigt den systemd-Status
-- `disable`: stoppt und deaktiviert den Dienst ohne Datei-Entfernung
-- `uninstall`: stoppt und deaktiviert den Dienst, entfernt installierte Unit und installierten Daemon, lädt `systemd` neu und entfernt vom Installer neu installierte Runtime-Pakete
-- `revert`: Alias für `uninstall`
-
-`disable`, `uninstall` und `revert` entfernen den State unter `/var/lib/kbd-backlight-service` nicht. Damit bleiben die pro Konto persistierten positiven Helligkeitswerte erhalten, falls der Dienst später erneut installiert wird.
-Der Installer merkt unter `/var/lib/kbd-backlight-service/runtime-packages.installed`, welche Runtime-Pakete vorher nicht installiert waren. Nur diese Pakete werden bei `uninstall` oder `revert` wieder entfernt.
-
-## Architektur
-
-Der Dienst ist ein ereignisgetriebener Daemon mit einem langsamen Abgleich als Schutzmechanismus.
-
-Benötigte Ereignisquellen:
-
-- `org.gnome.Mutter.IdleMonitor.AddIdleWatch`
-- `org.gnome.Mutter.IdleMonitor.AddUserActiveWatch`
-- `org.gnome.SettingsDaemon.Power.Keyboard.BrightnessChanged`
-- logind-DBus-Signale für aktive Sitzung, Seat und Sperrstatus
-- `inotify` auf jede `brightness`-Datei der erkannten Tastaturbeleuchtungen
-
-Die Implementierung koordiniert die Ereignisquellen in Python mit DBus- und inotify-Unterstützung.
-
-Die Runtime-Abhängigkeiten sind:
-
-- `python3-dbus-next`
-- `python3-asyncinotify`
-
-Fehlende Runtime-Abhängigkeiten installiert `scripts/kbd-backlight-service.sh install` automatisch über `apt-get`.
-
-Der root-Daemon verbindet sich mit dem Systembus, verwaltet sysfs, State-Dateien und logind-Ereignisse und startet pro aktiver relevanter Benutzer-Sitzung einen Worker mit Ziel-UID und Ziel-GID. Dieser Worker verbindet sich mit `DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/<uid>/bus` und meldet GNOME-Ereignisse per JSON-Zeilen an den root-Daemon zurück.
-
-Der Benutzerbus-Worker darf keine sysfs-Dateien schreiben und keine State-Dateien verändern. Er kapselt ausschließlich GNOME-DBus-Kommunikation im Benutzerkontext.
-
-`DEVICE_GLOB` begrenzt den aktuellen Dienst bewusst auf das validierte ASUS-Gerät. `POLL_INTERVAL` steuert nur den langsamen Reconcile-Timer.
-
-## Akzeptanzkriterien
-
-- GNOME- und sysfs-Helligkeit bleiben nach Dienstschreibvorgängen synchron.
-- Idle-Dimming passiert genau einmal pro Idle-Übergang.
-- Aktivitäts-Restore passiert genau einmal pro Aktivitäts-Übergang.
-- Manueller Wert `0` bleibt in entsperrten Benutzer-Sitzungen erhalten.
-- Sperrbildschirm und Greeter starten mit `BOOT_LEVEL` und überschreiben keine Konto-Werte.
-- Session-Wechsel erzwingen keine veraltete Helligkeit auf andere Benutzer.
-- Boot- und No-Session-Zustände verwenden `BOOT_LEVEL`.
-- sysfs bleibt der Fallback für nicht verfügbare GNOME-Sitzungen.
-- Normalbetrieb in GNOME läuft ohne schnelles Polling.
-- Fehler erscheinen im Journal oder führen zu einem klaren Dienstfehler.
-
-## Prüfung
+Status:
 
 ```bash
-shellcheck scripts/*.sh
-bash -n scripts/*.sh
 systemctl --no-pager --full status kbd-backlight-service.service
+```
+
+Journal:
+
+```bash
 journalctl -u kbd-backlight-service.service -b --no-pager -n 120
 ```
 
+sysfs:
+
 ```bash
-cat /sys/class/leds/*kbd_backlight*/brightness
-cat /sys/class/leds/*kbd_backlight*/max_brightness
-gdbus call --session --dest org.gnome.SettingsDaemon.Power --object-path /org/gnome/SettingsDaemon/Power --method org.freedesktop.DBus.Properties.Get org.gnome.SettingsDaemon.Power.Keyboard Brightness
-gdbus call --session --dest org.gnome.Mutter.IdleMonitor --object-path /org/gnome/Mutter/IdleMonitor/Core --method org.gnome.Mutter.IdleMonitor.GetIdletime
+cat /sys/class/leds/asus::kbd_backlight/brightness
+cat /sys/class/leds/asus::kbd_backlight/max_brightness
 ```
+
+GNOME-Helligkeit in der aktiven Sitzung, falls `gdbus` vorhanden ist:
+
+```bash
+gdbus call --session \
+  --dest org.gnome.SettingsDaemon.Power \
+  --object-path /org/gnome/SettingsDaemon/Power \
+  --method org.freedesktop.DBus.Properties.Get \
+  org.gnome.SettingsDaemon.Power.Keyboard Brightness
+```
+
+## Journalhinweise
+
+`GNOME idle unavailable` in einer Greeter-Sitzung ist zulässig, wenn GDM dort keinen Mutter IdleMonitor anbietet. Der Greeter wird beim Eintritt auf `BOOT_LEVEL` gesetzt; danach werden Greeter-Änderungen nicht vom Konto-State übernommen.
