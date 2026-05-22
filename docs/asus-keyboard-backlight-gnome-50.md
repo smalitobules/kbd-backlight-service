@@ -130,46 +130,44 @@ Beim Schreiben ist der rohe sysfs-Zielwert maßgeblich. Nach einem GNOME-DBus-Sc
 
 Ein manueller Wert `0` in einer entsperrten Benutzer-Sitzung bleibt eine explizite Benutzerentscheidung. Der Dienst erzwingt in diesem Zustand kein Wiederanschalten.
 
-Positive manuelle Änderungen am Sperrbildschirm oder Greeter werden für die nächste entsperrte Benutzer-Sitzung übernommen.
+Sperrbildschirm und Greeter werden beim Eintritt auf `BOOT_LEVEL` gesetzt. Danach bleiben dortige Änderungen bis zum Sitzungswechsel erlaubt und überschreiben keine Konto-Persistenz.
 
-Für Start, Herunterfahren und fehlende aktive Sitzungen wird der gespeicherte Boot-Wert auf mindestens `1` begrenzt.
+Start, Herunterfahren und fehlende aktive Sitzungen verwenden `BOOT_LEVEL`.
 
-## Polling
+Entsperrte Benutzer-Sitzungen verwenden den pro Konto gespeicherten positiven Wert.
 
-Die aktuelle Bash-Implementierung verwendet weiterhin Polling. Der Standardwert ist:
+## Ereignissteuerung
 
-- `POLL_INTERVAL=1`
+Der Dienst verwendet einen Python-Daemon mit Ereignisquellen für GNOME, logind und sysfs. Der Standardwert für den langsamen Abgleich ist:
 
-Pro Schleife prüft der Dienst:
+- `POLL_INTERVAL=10`
 
-- aktive Seat- und Session-ID über `loginctl`
-- Benutzer-ID, Session-Klasse und Sperrstatus über einen gebündelten `loginctl show-session`-Aufruf
-- Idle-Zeit über `org.gnome.Mutter.IdleMonitor.GetIdletime`
-- sysfs-Helligkeit für manuelle Änderungen und Persistenz
+Der normale GNOME-Betrieb läuft über:
 
-Dieser Zustand ist für den laufenden Betrieb akzeptabel, aber nicht der Zielzustand.
+- `org.gnome.Mutter.IdleMonitor.AddIdleWatch`
+- `org.gnome.Mutter.IdleMonitor.AddUserActiveWatch`
+- `org.gnome.SettingsDaemon.Power.Keyboard.BrightnessChanged`
+- logind-Signale für Seat-, Session- und Sperrstatusänderungen
+- `inotify` auf `brightness`-Dateien
+
+Der langsame Abgleich erkennt verlorene Ereignisse, neue oder entfernte sysfs-Geräte und divergierende Helligkeitszustände.
 
 ## Dienst-Lifecycle
 
-Aktuelle Skriptkommandos:
+Skriptkommandos:
 
 - `install`: installiert Daemon und Unit, aktiviert den Dienst und startet ihn neu
 - `status`: zeigt den systemd-Status
-- `uninstall`: stoppt und deaktiviert den Dienst, entfernt installierte Unit und installierten Daemon, lädt `systemd` neu
+- `disable`: stoppt und deaktiviert den Dienst ohne Datei-Entfernung
+- `uninstall`: stoppt und deaktiviert den Dienst, entfernt installierte Unit und installierten Daemon, lädt `systemd` neu und entfernt vom Installer neu installierte Runtime-Pakete
+- `revert`: Alias für `uninstall`
 
-`uninstall` entfernt den State unter `/var/lib/kbd-backlight-service` nicht. Damit bleibt der letzte persistierte positive Helligkeitswert erhalten, falls der Dienst später erneut installiert wird.
+`disable`, `uninstall` und `revert` entfernen den State unter `/var/lib/kbd-backlight-service` nicht. Damit bleiben die pro Konto persistierten positiven Helligkeitswerte erhalten, falls der Dienst später erneut installiert wird.
+Der Installer merkt unter `/var/lib/kbd-backlight-service/runtime-packages.installed`, welche Runtime-Pakete vorher nicht installiert waren. Nur diese Pakete werden bei `uninstall` oder `revert` wieder entfernt.
 
-Nicht vorhanden:
+## Architektur
 
-- `disable`: Stoppen und Deaktivieren ohne Entfernen installierter Dateien
-- `revert`: expliziter Rückbau auf System-/GNOME-Verhalten mit definierter Helligkeitswiederherstellung
-- `purge`: Entfernen von Dienst, Daemon und State
-
-Der aktuelle Rückweg zum normalen GNOME-/Systemverhalten ist `sudo ./scripts/kbd-backlight-service.sh uninstall`.
-
-## Zielarchitektur
-
-Der Zielzustand ist ein ereignisgetriebener Daemon mit einem langsamen Abgleich nur als Schutzmechanismus.
+Der Dienst ist ein ereignisgetriebener Daemon mit einem langsamen Abgleich als Schutzmechanismus.
 
 Benötigte Ereignisquellen:
 
@@ -179,18 +177,20 @@ Benötigte Ereignisquellen:
 - logind-DBus-Signale für aktive Sitzung, Seat und Sperrstatus
 - `inotify` auf jede `brightness`-Datei der erkannten Tastaturbeleuchtungen
 
-Die Implementierung soll mehrere Ereignisquellen sauber koordinieren können. Dafür wird Python mit DBus- und inotify-Unterstützung verwendet.
+Die Implementierung koordiniert die Ereignisquellen in Python mit DBus- und inotify-Unterstützung.
 
-Die konkrete Umsetzung verwendet:
+Die Runtime-Abhängigkeiten sind:
 
 - `python3-dbus-next`
 - `python3-asyncinotify`
 
-Der root-Daemon darf nicht davon ausgehen, dass er direkt auf die Benutzer-Session-Busse zugreifen kann. Für Benutzerbus-Verbindungen muss ein pro aktiver Benutzer-Sitzung laufender Prozess oder Teilprozess mit Ziel-UID und Ziel-GID gestartet werden. Dieser Prozess verbindet sich mit `DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/<uid>/bus` und meldet GNOME-Ereignisse an den root-Daemon zurück. Der root-Daemon bleibt zuständig für sysfs-Schreibzugriffe, State-Dateien und systemweite logind-Ereignisse.
+Fehlende Runtime-Abhängigkeiten installiert `scripts/kbd-backlight-service.sh install` automatisch über `apt-get`.
+
+Der root-Daemon verbindet sich mit dem Systembus, verwaltet sysfs, State-Dateien und logind-Ereignisse und startet pro aktiver relevanter Benutzer-Sitzung einen Worker mit Ziel-UID und Ziel-GID. Dieser Worker verbindet sich mit `DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/<uid>/bus` und meldet GNOME-Ereignisse per JSON-Zeilen an den root-Daemon zurück.
 
 Der Benutzerbus-Worker darf keine sysfs-Dateien schreiben und keine State-Dateien verändern. Er kapselt ausschließlich GNOME-DBus-Kommunikation im Benutzerkontext.
 
-`DEVICE_GLOB` begrenzt den aktuellen Dienst bewusst auf das validierte ASUS-Gerät. `POLL_INTERVAL` bleibt bis zur Umbenennung ein Kompatibilitätswert und steuert im ereignisgetriebenen Zielzustand nur noch den langsamen Reconcile-Timer. Der Reconcile-Timer darf nicht der normale Steuerpfad sein.
+`DEVICE_GLOB` begrenzt den aktuellen Dienst bewusst auf das validierte ASUS-Gerät. `POLL_INTERVAL` steuert nur den langsamen Reconcile-Timer.
 
 ## Akzeptanzkriterien
 
@@ -198,9 +198,9 @@ Der Benutzerbus-Worker darf keine sysfs-Dateien schreiben und keine State-Dateie
 - Idle-Dimming passiert genau einmal pro Idle-Übergang.
 - Aktivitäts-Restore passiert genau einmal pro Aktivitäts-Übergang.
 - Manueller Wert `0` bleibt in entsperrten Benutzer-Sitzungen erhalten.
-- Positive Änderungen am Sperrbildschirm oder Greeter werden in die nächste entsperrte Benutzer-Sitzung übernommen.
+- Sperrbildschirm und Greeter starten mit `BOOT_LEVEL` und überschreiben keine Konto-Werte.
 - Session-Wechsel erzwingen keine veraltete Helligkeit auf andere Benutzer.
-- Boot- und No-Session-Zustände verwenden nie dauerhaft `0`.
+- Boot- und No-Session-Zustände verwenden `BOOT_LEVEL`.
 - sysfs bleibt der Fallback für nicht verfügbare GNOME-Sitzungen.
 - Normalbetrieb in GNOME läuft ohne schnelles Polling.
 - Fehler erscheinen im Journal oder führen zu einem klaren Dienstfehler.
@@ -209,7 +209,7 @@ Der Benutzerbus-Worker darf keine sysfs-Dateien schreiben und keine State-Dateie
 
 ```bash
 shellcheck scripts/*.sh
-bash -n scripts/kbd-backlight-daemon.sh scripts/kbd-backlight-service.sh
+bash -n scripts/*.sh
 systemctl --no-pager --full status kbd-backlight-service.service
 journalctl -u kbd-backlight-service.service -b --no-pager -n 120
 ```

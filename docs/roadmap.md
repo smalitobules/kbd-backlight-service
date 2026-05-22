@@ -12,8 +12,8 @@ Zielzustand:
 - sysfs bleibt Fallback und Boot-/No-Session-Pfad.
 - `DEVICE_GLOB=/sys/class/leds/asus::kbd_backlight` begrenzt den aktuellen Support auf das validierte ASUS-Gerät.
 - `XDG_RUNTIME_DIR` und `DBUS_SESSION_BUS_ADDRESS` werden für Benutzerbus-Aufrufe explizit gesetzt.
-- `POLL_INTERVAL=1` hält die Prozesslast im Bash-Daemon begrenzt.
-- `loginctl show-session` wird gebündelt abgefragt.
+- `POLL_INTERVAL=10` steuert nur den langsamen Reconcile-Timer.
+- logind wird über den Systembus abgefragt.
 
 Prüfung:
 
@@ -32,7 +32,7 @@ Zielzustand:
 - Rohwert-Prozentwert-Mapping ist als isolierte Funktion testbar.
 - Session-Zustände sind als explizite Zustände modelliert.
 - Helligkeitsentscheidungen sind von DBus- und sysfs-I/O getrennt.
-- Boot-Level-Persistenz ist separat testbar.
+- Konto-Persistenz ist separat testbar.
 
 Ergebnis:
 
@@ -102,9 +102,9 @@ Der Umbau ist abgeschlossen, wenn:
 - Idle-Dimming genau einmal pro Idle-Übergang passiert
 - Aktivitäts-Restore genau einmal pro Aktivitäts-Übergang passiert
 - manuelles `0` in entsperrten Benutzer-Sitzungen erhalten bleibt
-- Sperrbildschirm- und Greeter-Änderungen korrekt übernommen werden
-- Dienstneustart den gespeicherten positiven Boot-Wert wiederherstellt
-- No-Session-Zustände nie `0` persistieren
+- Sperrbildschirm und Greeter beim Eintritt `BOOT_LEVEL` verwenden
+- Dienstneustart den gespeicherten positiven Konto-Wert wiederherstellt
+- No-Session-Zustände `BOOT_LEVEL` verwenden
 - Normalbetrieb keine schnelle Polling-Schleife verwendet
 - `journalctl -u kbd-backlight-service.service -b` keine wiederkehrenden Fehler zeigt
 
