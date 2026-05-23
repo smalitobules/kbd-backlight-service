@@ -37,6 +37,18 @@ class TransitionTest(unittest.TestCase):
         self.assertEqual(decision.activity_transition(uid, 0, allow_manual_off=True), 2)
         self.assertIsNone(decision.activity_transition(uid, 2, allow_manual_off=True))
 
+    def test_observed_managed_idle_zero_still_restores_on_activity(self) -> None:
+        decision = BacklightDecision(boot_level=1, last_nonzero_level=2)
+        uid = 1000
+        decision.finish_activation(uid, 2, allow_manual_off=True)
+        self.assertEqual(decision.idle_transition(uid, 2), 0)
+        decision.set_managed_level(uid, 0)
+
+        result = decision.observe(uid, 0, allow_manual_off=True)
+
+        self.assertFalse(result.manual_off)
+        self.assertEqual(decision.activity_transition(uid, 0, allow_manual_off=True), 2)
+
     def test_locked_positive_change_does_not_override_account_level(self) -> None:
         decision = BacklightDecision(boot_level=1, last_nonzero_level=1)
         uid = 1000

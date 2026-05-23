@@ -21,7 +21,7 @@ Der root-Daemon verwaltet:
 - State unter `/var/lib/kbd-backlight-service`
 - Gerätesuche über `DEVICE_GLOB`
 - User-DBus-Worker
-- Reconcile-Timer
+- Reconcile-Timer für Geräte, Sitzungen und GNOME-Idle-Zeit
 
 Der User-DBus-Worker läuft mit Ziel-UID und Ziel-GID der aktiven relevanten Sitzung. Er verbindet sich mit:
 
@@ -200,3 +200,5 @@ gdbus call --session \
 ## Journalhinweise
 
 `GNOME idle unavailable` in einer Greeter-Sitzung ist zulässig, wenn GDM dort keinen Mutter IdleMonitor anbietet. Der Greeter wird beim Eintritt auf `BOOT_LEVEL` gesetzt; danach werden Greeter-Änderungen nicht vom Konto-State übernommen.
+
+Wenn GNOME nach Display-Energiesparen kein Aktivitätsereignis liefert, prüft der Reconcile-Timer `GetIdletime` über den User-DBus-Worker und stellt eine durch den Dienst gedimmte Kontositzung wieder her.

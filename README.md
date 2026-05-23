@@ -82,7 +82,7 @@ Die installierte Unit nutzt diese Standardwerte:
 - `STATE_DIR=/var/lib/kbd-backlight-service`
 - `DEVICE_GLOB=/sys/class/leds/asus::kbd_backlight`
 
-`TIMEOUT_MS` ist die Inaktivitätszeit bis zum Dimmen. `BOOT_LEVEL` ist die Helligkeit für Boot, Greeter-Eintritt, Sperrbildschirm-Eintritt, Herunterfahren und fehlende aktive Sitzungen. `POLL_INTERVAL` steuert nur den langsamen Sicherheitsabgleich. `STATE_DIR` ist fest auf `/var/lib/kbd-backlight-service` begrenzt.
+`TIMEOUT_MS` ist die Inaktivitätszeit bis zum Dimmen. `BOOT_LEVEL` ist die Helligkeit für Boot, Greeter-Eintritt, Sperrbildschirm-Eintritt, Herunterfahren und fehlende aktive Sitzungen. `POLL_INTERVAL` steuert den langsamen Sicherheitsabgleich für Geräte, Sitzungen und verpasste GNOME-Idle-Ereignisse. `STATE_DIR` ist fest auf `/var/lib/kbd-backlight-service` begrenzt.
 
 `DEVICE_GLOB` kann beim Installieren gesetzt werden:
 

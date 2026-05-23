@@ -164,7 +164,7 @@ install_service() {
     trap 'rm -f "${tmp}"' RETURN
     cat >"${tmp}" <<EOF
 [Unit]
-Description=ASUS keyboard backlight idle and lock service
+Description=ASUS keyboard backlight service
 After=systemd-logind.service
 Wants=systemd-logind.service
 ConditionPathExists=/sys/class/leds

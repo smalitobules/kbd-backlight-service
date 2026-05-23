@@ -330,10 +330,14 @@ class DBusClient:
         await self.call(destination, path, PROPERTIES_INTERFACE, "Set", "ssv", [interface_name, property_name, variant])
 
 
+def is_json_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
 def parse_uid(value: object) -> int:
-    if isinstance(value, int):
+    if is_json_int(value):
         return value
-    if isinstance(value, (tuple, list)) and value and isinstance(value[0], int):
+    if isinstance(value, (tuple, list)) and value and is_json_int(value[0]):
         return value[0]
     return -1
 
@@ -370,6 +374,7 @@ class WorkerClient:
         self.queue = queue
         self.pending: dict[int, asyncio.Future[JsonObject]] = {}
         self.next_request_id = 1
+        self.command_lock = asyncio.Lock()
         self.reader_task: asyncio.Task[None] | None = None
         self.stderr_task: asyncio.Task[None] | None = None
 
@@ -424,12 +429,15 @@ class WorkerClient:
                     message = normalize_json_object(decoded)
                     message_type = message.get("type")
                     request_id = message.get("request_id")
-                    if isinstance(request_id, int) and request_id in self.pending:
-                        future = self.pending.pop(request_id)
-                        if message_type == "event_error":
-                            future.set_exception(RuntimeError(str(message.get("message", "worker error"))))
-                        else:
-                            future.set_result(message)
+                    if is_json_int(request_id):
+                        future = self.pending.pop(request_id, None)
+                        if future is None:
+                            continue
+                        if not future.done():
+                            if message_type == "event_error":
+                                future.set_exception(RuntimeError(str(message.get("message", "worker error"))))
+                            else:
+                                future.set_result(message)
                         continue
                     await self.queue.put(worker_message_to_event(message))
                 except Exception as exc:
@@ -452,31 +460,39 @@ class WorkerClient:
                 logging.error("GNOME worker session %s stderr: %s", self.session.session_id, text)
 
     async def send_command(self, command_type: str, payload: JsonObject, timeout: float = 2.0) -> JsonObject:
-        stdin = self.process.stdin
-        if stdin is None:
-            raise RuntimeError("worker stdin is not available")
-        request_id = self.next_request_id
-        self.next_request_id += 1
-        message: JsonObject = {
-            "type": command_type,
-            "session_id": self.session.session_id,
-            "uid": self.session.uid,
-            "timestamp_ms": wall_timestamp_ms(),
-            "request_id": request_id,
-        }
-        message.update(payload)
-        loop = asyncio.get_running_loop()
-        future: asyncio.Future[JsonObject] = loop.create_future()
-        self.pending[request_id] = future
-        stdin.write((json.dumps(message, separators=(",", ":")) + "\n").encode("utf-8"))
-        await stdin.drain()
-        try:
-            return await asyncio.wait_for(future, timeout)
-        finally:
-            self.pending.pop(request_id, None)
+        async with self.command_lock:
+            stdin = self.process.stdin
+            if stdin is None:
+                raise RuntimeError("worker stdin is not available")
+            request_id = self.next_request_id
+            self.next_request_id += 1
+            message: JsonObject = {
+                "type": command_type,
+                "session_id": self.session.session_id,
+                "uid": self.session.uid,
+                "timestamp_ms": wall_timestamp_ms(),
+                "request_id": request_id,
+            }
+            message.update(payload)
+            loop = asyncio.get_running_loop()
+            future: asyncio.Future[JsonObject] = loop.create_future()
+            self.pending[request_id] = future
+            try:
+                stdin.write((json.dumps(message, separators=(",", ":")) + "\n").encode("utf-8"))
+                await stdin.drain()
+                return await asyncio.wait_for(future, timeout)
+            finally:
+                self.pending.pop(request_id, None)
 
     async def set_brightness(self, percent: int, target_level: int) -> None:
         await self.send_command("cmd_set_brightness", {"percent": percent, "target_level": target_level})
+
+    async def sync_idle_state(self) -> int:
+        response = await self.send_command("cmd_sync_idle_state", {})
+        idle_ms = response.get("idle_ms")
+        if not is_json_int(idle_ms):
+            raise ProtocolError("cmd_sync_idle_state returned invalid idle_ms")
+        return max(idle_ms, 0)
 
     async def stop(self) -> None:
         if self.process.returncode is not None:
@@ -522,9 +538,9 @@ def worker_message_to_event(message: JsonObject) -> RootEvent:
     session_value = message.get("session_id")
     uid_value = message.get("uid")
     session_id = session_value if isinstance(session_value, str) else None
-    uid = uid_value if isinstance(uid_value, int) else None
+    uid = uid_value if is_json_int(uid_value) else None
     percent_value = message.get("percent")
-    percent = percent_value if isinstance(percent_value, int) else None
+    percent = percent_value if is_json_int(percent_value) else None
     source_value = message.get("source")
     source = source_value if isinstance(source_value, str) else None
     message_value = message.get("message")
@@ -558,6 +574,7 @@ class RootDaemon:
         self.deferred_idle_deadlines: dict[tuple[str, int], int] = {}
         self.deferred_idle_tasks: set[asyncio.Task[None]] = set()
         self.worker_relevance_messages: dict[str, str] = {}
+        self.idle_reconcile_failures: dict[str, str] = {}
         self.session_summary: tuple[str, ...] = ()
         self.inotify_task: asyncio.Task[None] | None = None
         self.reconcile_task: asyncio.Task[None] | None = None
@@ -761,6 +778,7 @@ class RootDaemon:
                 await self.refresh_sessions()
                 await self.apply_active_session()
                 await self.observe_active_session_state()
+                await self.reconcile_idle_state()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -807,7 +825,7 @@ class RootDaemon:
             return None
         uid = parse_uid(properties.get("User"))
         if uid < 0:
-            uid = int(row[1]) if len(row) > 1 and isinstance(row[1], int) else -1
+            uid = int(row[1]) if len(row) > 1 and is_json_int(row[1]) else -1
         return SessionInfo(
             session_id=session_id,
             path=path,
@@ -841,6 +859,7 @@ class RootDaemon:
         for session_id in list(self.workers):
             if session_id not in relevant:
                 worker = self.workers.pop(session_id)
+                self.idle_reconcile_failures.pop(session_id, None)
                 await worker.stop()
         for session_id, session in relevant.items():
             if session_id in self.workers:
@@ -1004,6 +1023,35 @@ class RootDaemon:
         if session.unlocked_user:
             self.update_account_levels_for_session(session)
 
+    async def reconcile_idle_state(self) -> None:
+        session = self.selected_active_session()
+        if session is None or session.uid < 0 or not session.unlocked_user:
+            return
+        worker = self.workers.get(session.session_id)
+        if worker is None:
+            return
+        try:
+            idle_ms = await worker.sync_idle_state()
+        except Exception as exc:
+            message = str(exc)
+            if self.idle_reconcile_failures.get(session.session_id) != message:
+                logging.warning("GNOME idle reconcile failed for session %s uid %s: %s", session.session_id, session.uid, message)
+                self.idle_reconcile_failures[session.session_id] = message
+            return
+        if session.session_id in self.idle_reconcile_failures:
+            logging.info("GNOME idle reconcile recovered for session %s uid %s", session.session_id, session.uid)
+            self.idle_reconcile_failures.pop(session.session_id, None)
+        if idle_ms >= self.config.timeout_ms:
+            await self.handle_idle_event(RootEvent("event_idle", session.session_id, session.uid))
+            return
+        if self.session_needs_activity_restore(session):
+            await self.handle_active_event(RootEvent("event_active", session.session_id, session.uid))
+
+    def session_needs_activity_restore(self, session: SessionInfo) -> bool:
+        if self.deferred_idle_key(session) in self.deferred_idle_deadlines:
+            return True
+        return any(device.decision.dimmed_flags.get(session.uid, False) for device in self.devices.values())
+
     def deferred_idle_key(self, session: SessionInfo) -> tuple[str, int]:
         return (session.session_id, session.uid)
 
@@ -1153,8 +1201,7 @@ class UserWorker:
         if self.dbus is None:
             return
         try:
-            body = await self.dbus.call(MUTTER_DESTINATION, MUTTER_PATH, MUTTER_INTERFACE, "GetIdletime")
-            idle_ms = int(unpack_variant(body[0])) if body else 0
+            idle_ms = await self.read_idle_ms()
             if idle_ms >= self.timeout_ms:
                 self.emit({"type": "event_idle"})
                 self.active_watch_id = await self.add_active_watch()
@@ -1174,6 +1221,25 @@ class UserWorker:
             raise RuntimeError("session bus is not connected")
         body = await self.dbus.call(MUTTER_DESTINATION, MUTTER_PATH, MUTTER_INTERFACE, "AddUserActiveWatch")
         return int(unpack_variant(body[0]))
+
+    async def read_idle_ms(self) -> int:
+        if self.dbus is None:
+            raise RuntimeError("session bus is not connected")
+        body = await self.dbus.call(MUTTER_DESTINATION, MUTTER_PATH, MUTTER_INTERFACE, "GetIdletime")
+        idle_ms = int(unpack_variant(body[0])) if body else 0
+        return max(idle_ms, 0)
+
+    async def sync_idle_state(self) -> int:
+        idle_ms = await self.read_idle_ms()
+        if idle_ms >= self.timeout_ms:
+            if self.active_watch_id is None:
+                self.idle_watch_id = None
+                self.active_watch_id = await self.add_active_watch()
+            return idle_ms
+        if self.idle_watch_id is None:
+            self.active_watch_id = None
+            self.idle_watch_id = await self.add_idle_watch()
+        return idle_ms
 
     def handle_dbus_message(self, message: object) -> None:
         if getattr(message, "message_type") != self.imports.message_type.SIGNAL:
@@ -1210,7 +1276,7 @@ class UserWorker:
             return
         brightness = body[0]
         source = body[1]
-        if not isinstance(brightness, int):
+        if not is_json_int(brightness):
             return
         self.emit(
             {
@@ -1241,10 +1307,14 @@ class UserWorker:
             self.emit({"type": "event_stopped", "request_id": request_id})
             self.running = False
             return
+        if command_type == "cmd_sync_idle_state":
+            idle_ms = await self.sync_idle_state()
+            self.emit({"type": "event_idle_state", "request_id": request_id, "idle_ms": idle_ms})
+            return
         if command_type != "cmd_set_brightness":
             raise ProtocolError(f"unknown command {command_type}")
         percent_value = message.get("percent")
-        if not isinstance(percent_value, int):
+        if not is_json_int(percent_value):
             raise ProtocolError("cmd_set_brightness requires integer percent")
         if self.dbus is None:
             raise RuntimeError("session bus is not connected")
